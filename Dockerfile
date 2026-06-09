@@ -3,6 +3,7 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
+COPY .npmrc ./
 RUN npm ci
 
 COPY tsconfig.json ./
@@ -20,6 +21,7 @@ ENV TZ=UTC
 RUN apk add --no-cache tzdata ca-certificates
 
 COPY package*.json ./
+COPY .npmrc ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
