@@ -1,0 +1,285 @@
+# log-alert 告警规则示例
+
+rules:
+  # ===== 简单条件规则 =====
+  - id: error_log_detected
+    name: 错误日志检测
+    description: 检测ERROR/FATAL级别的日志
+    severity: warning
+    priority: 10
+    enabled: true
+    cooldown_seconds: 60
+    condition:
+      type: simple
+      field: level
+      operator: in
+      value: ["ERROR", "FATAL"]
+    actions:
+      - type: console
+        color: true
+    dedup:
+      window_seconds: 300
+      hash_prefix_length: 64
+
+  - id: http_5xx_error
+    name: HTTP 5xx 错误
+    description: 检测5xx服务器错误
+    severity: critical
+    priority: 5
+    enabled: true
+    cooldown_seconds: 30
+    condition:
+      type: simple
+      field: fields.status
+      operator: ">="
+      value: 500
+    actions:
+      - type: console
+      - type: webhook
+        url: https://hooks.example.com/alert
+        headers:
+          Authorization: Bearer xxx
+
+  # ===== 组合条件规则 =====
+  - id: payment_failed_error
+    name: 支付服务错误
+    description: 支付服务相关的错误日志
+    severity: critical
+    priority: 3
+    enabled: true
+    condition:
+      type: composite
+      operator: AND
+      conditions:
+        - type: simple
+          field: level
+          operator: "=="
+          value: ERROR
+        - type: composite
+          operator: OR
+          conditions:
+            - type: simple
+              field: message
+              operator: contains
+              value: payment
+            - type: simple
+              field: message
+              operator: contains
+              value: Payment
+            - type: simple
+              field: fields.service
+              operator: "=="
+              value: payment-service
+    actions:
+      - type: console
+
+  # ===== 时间窗口聚合规则 - 全局计数 =====
+  - id: high_error_rate
+    name: 错误率过高
+    description: 5分钟内错误日志超过50条
+    severity: critical
+    priority: 2
+    enabled: true
+    cooldown_seconds: 300
+    condition:
+      type: aggregate
+      window_seconds: 300
+      slide_seconds: 10
+      threshold: 50
+      aggregation: count
+      base_condition:
+        type: simple
+        field: level
+        operator: in
+        value: ["ERROR", "FATAL"]
+    actions:
+      - type: console
+      - type: http
+        method: POST
+        url: https://api.example.com/oncall/page
+        headers:
+          Content-Type: application/json
+        body_template: |
+          {
+            "title": "{{alert.ruleName}}",
+            "severity": "{{alert.severity}}",
+            "error_count": "{{payload.logs_count}}"
+          }
+    escalation:
+      to_severity: critical
+      after_seconds: 600
+
+  # ===== 时间窗口聚合规则 - 按字段分组 =====
+  - id: brute_force_ip
+    name: IP暴力破解检测
+    description: 同一IP在1分钟内404超过20次
+    severity: warning
+    priority: 8
+    enabled: true
+    condition:
+      type: aggregate
+      window_seconds: 60
+      slide_seconds: 10
+      threshold: 20
+      group_by: ["fields.client_ip"]
+      aggregation: count
+      base_condition:
+        type: simple
+        field: fields.status
+        operator: "=="
+        value: 404
+    actions:
+      - type: console
+    recovery_notification: true
+
+  - id: slow_api_response
+    name: API响应过慢
+    description: 同一接口5分钟内平均响应时间超过2秒
+    severity: warning
+    priority: 15
+    enabled: true
+    condition:
+      type: aggregate
+      window_seconds: 300
+      slide_seconds: 30
+      threshold: 2.0
+      group_by: ["fields.path", "fields.method"]
+      aggregation: avg
+      aggregate_field: fields.response_time
+      base_condition:
+        type: simple
+        field: fields.response_time
+        operator: ">"
+        value: 0.5
+    actions:
+      - type: console
+
+  # ===== 序列规则 =====
+  - id: brute_force_success
+    name: 暴力破解后登录成功
+    description: 先多次登录失败，短时间内登录成功
+    severity: critical
+    priority: 1
+    enabled: true
+    max_total_seconds: 120
+    condition:
+      type: sequence
+      key_field: fields.user_id
+      max_total_seconds: 120
+      events:
+        - event_id: login_failed
+          timeout_seconds: 60
+          condition:
+            type: simple
+            field: message
+            operator: matches
+            value: "login.*fail|LoginFail"
+        - event_id: login_success
+          timeout_seconds: 30
+          condition:
+            type: simple
+            field: message
+            operator: matches
+            value: "login.*success|LoginSuccess"
+    actions:
+      - type: console
+      - type: webhook
+        url: https://hooks.example.com/security
+    depends_on: []
+
+  - id: oom_then_crash
+    name: 内存溢出后崩溃
+    description: 先OOM警告，短时间内进程退出
+    severity: critical
+    priority: 4
+    enabled: true
+    condition:
+      type: sequence
+      key_field: source
+      max_total_seconds: 300
+      events:
+        - event_id: oom_warning
+          timeout_seconds: 120
+          condition:
+            type: simple
+            field: message
+            operator: contains
+            value: OutOfMemory
+        - event_id: process_exit
+          timeout_seconds: 180
+          condition:
+            type: composite
+            operator: OR
+            conditions:
+              - type: simple
+                field: message
+                operator: contains
+                value: "exit code"
+              - type: simple
+                field: message
+                operator: contains
+                value: crashed
+              - type: simple
+                field: level
+                operator: "=="
+                value: FATAL
+    actions:
+      - type: console
+
+  # ===== Top-N 频率统计 =====
+  - id: top_errors
+    name: 高频错误Top10
+    description: 每10分钟统计最频繁的错误消息
+    severity: info
+    priority: 50
+    enabled: true
+    condition:
+      type: simple
+      field: level
+      operator: in
+      value: ["ERROR", "FATAL"]
+    top_n:
+      window_seconds: 600
+      n: 10
+    actions:
+      - type: console
+
+  # ===== 依赖抑制示例 =====
+  - id: database_down
+    name: 数据库连接失败
+    description: 数据库无法连接
+    severity: critical
+    priority: 1
+    enabled: true
+    cooldown_seconds: 600
+    condition:
+      type: simple
+      field: message
+      operator: matches
+      value: "connection.*refused|ConnectionTimeout|connect.*fail|database.*down"
+    actions:
+      - type: console
+    recovery_notification: true
+
+  - id: app_query_error
+    name: 应用查询错误
+    description: 应用层数据库查询错误（依赖数据库告警）
+    severity: warning
+    priority: 20
+    enabled: true
+    depends_on: ["database_down"]
+    cooldown_seconds: 120
+    condition:
+      type: composite
+      operator: AND
+      conditions:
+        - type: simple
+          field: level
+          operator: "=="
+          value: ERROR
+        - type: simple
+          field: message
+          operator: contains
+          value: query
+    actions:
+      - type: console

@@ -1,0 +1,44 @@
+# log-alert 示例配置文件
+
+# HTTP API 端口
+http_api_port: 3000
+
+# 时区
+timezone: Asia/Shanghai
+
+# 测试模式 (不真正发送告警)
+dry_run: false
+
+# 全局告警输出通道
+global_outputs:
+  - type: console
+    color: true
+
+# 输入源配置
+input_sources:
+  - id: nginx_access
+    type: file
+    path: /var/log/nginx/access.log
+    parser_config:
+      format: nginx
+      source: nginx
+
+  - id: app_json
+    type: file
+    path: /var/log/app/*.log
+    parser_config:
+      format: json
+      time_field: timestamp
+      level_field: level
+      source: app
+
+  - id: system_syslog
+    type: file
+    path: /var/log/syslog
+    parser_config:
+      format: syslog
+      source: syslog
+
+# 规则文件列表
+rule_files:
+  - rules.yaml
