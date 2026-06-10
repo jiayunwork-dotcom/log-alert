@@ -103,20 +103,26 @@ export function loadAppConfig(configPath?: string): AppConfig {
 function parseConfigFile(configPath: string): AppConfig {
   const content = fs.readFileSync(configPath, 'utf8');
   const parsed = yaml.load(content) as any;
+  const configDir = path.dirname(path.resolve(configPath));
+
+  const resolveRelative = (p: string): string => {
+    if (path.isAbsolute(p)) return p;
+    return path.resolve(configDir, p);
+  };
 
   const inputSources: InputSource[] = [];
   if (parsed.input_sources && Array.isArray(parsed.input_sources)) {
     for (const raw of parsed.input_sources) {
-      inputSources.push(convertInputSource(raw));
+      inputSources.push(convertInputSource(raw, resolveRelative));
     }
   }
 
   const ruleFiles: string[] = [];
   if (parsed.rule_files) {
     if (Array.isArray(parsed.rule_files)) {
-      ruleFiles.push(...parsed.rule_files);
+      ruleFiles.push(...parsed.rule_files.map(resolveRelative));
     } else if (typeof parsed.rule_files === 'string') {
-      ruleFiles.push(parsed.rule_files);
+      ruleFiles.push(resolveRelative(parsed.rule_files));
     }
   }
 
@@ -140,7 +146,7 @@ function parseConfigFile(configPath: string): AppConfig {
   };
 }
 
-function convertInputSource(raw: any): InputSource {
+function convertInputSource(raw: any, resolveRelative?: (p: string) => string): InputSource {
   const type = raw.type || 'file';
   const parserConfig: ParserConfig = convertParserConfig(raw.parser_config || {});
 
@@ -172,7 +178,7 @@ function convertInputSource(raw: any): InputSource {
       return {
         type: 'file',
         id: raw.id || `file_${raw.path || 'default'}`,
-        path: raw.path || '',
+        path: (raw.path && resolveRelative) ? resolveRelative(raw.path) : (raw.path || ''),
         pattern: raw.pattern,
         parserConfig
       };

@@ -228,8 +228,22 @@ export class InputManager extends EventEmitter {
   }
 
   processHttpPayload(sourceId: string, data: string | object): StructuredLog[] {
-    const parser = this.parsers.get(sourceId);
-    if (!parser) return [];
+    let parser = this.parsers.get(sourceId);
+    if (!parser) {
+      const httpParser = Array.from(this.parsers.entries())
+        .find(([id, p]) => id.startsWith('http_') && p.getConfig()?.format === 'json');
+      if (httpParser) {
+        parser = httpParser[1];
+      }
+    }
+    if (!parser) {
+      const jsonParser = Array.from(this.parsers.values()).find(p => p.getConfig()?.format === 'json');
+      if (jsonParser) parser = jsonParser;
+    }
+    if (!parser) {
+      parser = new LogParser({ format: 'json', source: sourceId }, this.options.timezone);
+      this.parsers.set(sourceId, parser);
+    }
 
     const results: StructuredLog[] = [];
     const lines: string[] = [];

@@ -148,9 +148,9 @@ export class ApiServer {
         const lines = req.body.lines || [];
         const maxSuggestions = req.body.max_suggestions || 5;
 
-        if (lines.length < 10) {
+        if (lines.length < 20) {
           reply.code(400).send({
-            error: 'At least 10 sample lines required for inference'
+            error: 'At least 20 sample lines required for inference'
           });
           return;
         }

@@ -231,8 +231,8 @@ program
         if (line.trim()) lines.push(line.trim());
       }
 
-      if (lines.length < 10) {
-        console.error(`样本行数不足: ${lines.length} 行，至少需要 10 行`);
+      if (lines.length < 20) {
+        console.error(`样本行数不足: ${lines.length} 行，至少需要 20 行`);
         process.exit(1);
       }
 

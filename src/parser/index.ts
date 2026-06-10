@@ -101,6 +101,10 @@ export class LogParser {
     }
   }
 
+  getConfig(): ParserConfig {
+    return this.config;
+  }
+
   updateConfig(config: ParserConfig): void {
     this.config = config;
     this.compilePatterns();
