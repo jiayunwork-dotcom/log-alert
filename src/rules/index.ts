@@ -3,8 +3,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as chokidar from 'chokidar';
 import * as yaml from 'js-yaml';
+import { EventEmitter } from 'events';
 import { AlertRuleEngine } from '../engine';
 import { OutputDispatcher } from '../outputs';
+import { ChangeType, RulesChangedEvent, deepClone } from '../versions';
+
+function deepCloneRules(rules: AlertRule[]): AlertRule[] {
+  return deepClone(rules);
+}
 
 export interface RuleManagerOptions {
   dryRun?: boolean;
@@ -66,7 +72,7 @@ type RawOutputChannel =
   | { type: 'console'; color?: boolean }
   | { type: 'http'; method: 'GET' | 'POST' | 'PUT'; url: string; headers?: Record<string, string>; body_template?: string; template_id?: string };
 
-export class RuleManager {
+export class RuleManager extends EventEmitter {
   private ruleFiles: string[] = [];
   private watchers: chokidar.FSWatcher[] = [];
   private engine: AlertRuleEngine;
@@ -80,9 +86,19 @@ export class RuleManager {
     outputDispatcher: OutputDispatcher,
     options: RuleManagerOptions = {}
   ) {
+    super();
     this.engine = engine;
     this.outputDispatcher = outputDispatcher;
     this.options = options;
+  }
+
+  emitRulesChanged(event: Omit<RulesChangedEvent, 'timestamp'>): void {
+    this.emit('rulesChanged', event);
+  }
+
+  onRulesChanged(listener: (event: RulesChangedEvent) => void): this {
+    this.on('rulesChanged', listener);
+    return this;
   }
 
   async loadRuleFiles(filePaths: string[]): Promise<AlertRule[]> {
@@ -100,9 +116,21 @@ export class RuleManager {
       allRules.push(...rules);
     }
 
+    const rulesBefore = [...this.rules];
+    const changedRuleIds = this.getChangedRuleIds(rulesBefore, allRules);
     this.rules = allRules;
     this.engine.loadRules(allRules);
     this.setupFileWatchers(filePaths);
+
+    if (changedRuleIds.length > 0 || rulesBefore.length !== allRules.length) {
+      this.emitRulesChanged({
+        changeType: 'reload',
+        changedRuleIds,
+        rulesBefore,
+        rulesAfter: allRules,
+        operator: 'system'
+      });
+    }
 
     return allRules;
   }
@@ -264,6 +292,7 @@ export class RuleManager {
         }
       }
 
+      const rulesBefore = [...this.rules];
       const existingIds = new Set(this.rules.map(r => r.id));
       const newIds = new Set(allRules.map(r => r.id));
 
@@ -280,10 +309,21 @@ export class RuleManager {
       }
 
       this.rules = allRules;
+      const changedRuleIds = this.getChangedRuleIds(rulesBefore, allRules);
       console.info(`[RuleManager] Loaded ${allRules.length} rules`);
 
       if (this.options.onRulesReloaded) {
         this.options.onRulesReloaded(allRules);
+      }
+
+      if (changedRuleIds.length > 0 || rulesBefore.length !== allRules.length) {
+        this.emitRulesChanged({
+          changeType: 'reload',
+          changedRuleIds,
+          rulesBefore,
+          rulesAfter: allRules,
+          operator: 'system'
+        });
       }
     } catch (e) {
       console.error('Error reloading rules:', e);
@@ -300,16 +340,120 @@ export class RuleManager {
     return this.rules.find(r => r.id === id);
   }
 
-  setRuleEnabled(id: string, enabled: boolean): boolean {
-    return this.engine.setRuleEnabled(id, enabled);
+  setRuleEnabled(id: string, enabled: boolean, operator: string = 'system'): boolean {
+    const rule = this.getRule(id);
+    if (!rule) return false;
+
+    const rulesBefore = deepCloneRules(this.rules);
+    const result = this.engine.setRuleEnabled(id, enabled);
+    const rulesAfter = deepCloneRules(this.rules);
+
+    if (result) {
+      this.emitRulesChanged({
+        changeType: enabled ? 'enable' : 'disable',
+        changedRuleIds: [id],
+        rulesBefore,
+        rulesAfter,
+        operator
+      });
+    }
+
+    return result;
   }
 
-  suppressRule(id: string, durationSeconds: number): boolean {
-    return this.engine.suppressRule(id, durationSeconds);
+  suppressRule(id: string, durationSeconds: number, operator: string = 'system'): boolean {
+    const rule = this.getRule(id);
+    if (!rule) return false;
+
+    const rulesBefore = deepCloneRules(this.rules);
+    const result = this.engine.suppressRule(id, durationSeconds);
+    const rulesAfter = deepCloneRules(this.rules);
+
+    if (result) {
+      this.emitRulesChanged({
+        changeType: 'update',
+        changedRuleIds: [id],
+        rulesBefore,
+        rulesAfter,
+        operator
+      });
+    }
+
+    return result;
   }
 
-  resetRuleState(id: string): void {
+  resetRuleState(id: string, operator: string = 'system'): void {
+    const rule = this.getRule(id);
+    if (!rule) return;
+
+    const rulesBefore = deepCloneRules(this.rules);
     this.engine.resetRuleState(id);
+    const rulesAfter = deepCloneRules(this.rules);
+
+    this.emitRulesChanged({
+      changeType: 'update',
+      changedRuleIds: [id],
+      rulesBefore,
+      rulesAfter,
+      operator
+    });
+  }
+
+  replaceRules(newRules: AlertRule[]): { addedCount: number; removedCount: number; modifiedCount: number } {
+    const rulesBefore = deepCloneRules(this.rules);
+    const beforeMap = new Map(this.rules.map(r => [r.id, r]));
+    const afterMap = new Map(newRules.map(r => [r.id, r]));
+
+    let addedCount = 0;
+    let removedCount = 0;
+    let modifiedCount = 0;
+
+    for (const [id] of beforeMap) {
+      if (!afterMap.has(id)) {
+        this.engine.removeRule(id);
+        removedCount++;
+      }
+    }
+
+    for (const [id, rule] of afterMap) {
+      if (!beforeMap.has(id)) {
+        this.engine.addRule(rule);
+        addedCount++;
+      } else {
+        this.engine.updateRule(rule);
+        modifiedCount++;
+      }
+    }
+
+    this.rules = newRules;
+    return { addedCount, removedCount, modifiedCount };
+  }
+
+  private getChangedRuleIds(before: AlertRule[], after: AlertRule[]): string[] {
+    const changedIds = new Set<string>();
+    const beforeMap = new Map(before.map(r => [r.id, r]));
+    const afterMap = new Map(after.map(r => [r.id, r]));
+
+    for (const [id] of afterMap) {
+      if (!beforeMap.has(id)) {
+        changedIds.add(id);
+      }
+    }
+    for (const [id] of beforeMap) {
+      if (!afterMap.has(id)) {
+        changedIds.add(id);
+      }
+    }
+    for (const [id, afterRule] of afterMap) {
+      if (beforeMap.has(id)) {
+        const beforeRule = beforeMap.get(id)!;
+        if (JSON.stringify(beforeRule) !== JSON.stringify(afterRule)) {
+          changedIds.add(id);
+        }
+      }
+    }
+
+    return Array.from(changedIds);
   }
 
   stop(): void {

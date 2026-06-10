@@ -5,6 +5,7 @@ import { OutputDispatcher } from '../outputs';
 import { RuleManager } from '../rules';
 import { SilenceManager } from '../silences';
 import { TemplateEngine } from '../templates';
+import { VersionManager, RulesChangedEvent, deepClone, RollbackResult, diffRules } from '../versions';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
@@ -16,6 +17,7 @@ export interface AppRuntime {
   ruleManager: RuleManager;
   silenceManager: SilenceManager;
   templateEngine: TemplateEngine;
+  versionManager: VersionManager;
   config: AppConfig;
   processedCount: number;
   alertCount: number;
@@ -58,6 +60,8 @@ export function createAppRuntime(config: AppConfig): AppRuntime {
     timezone: config.timezone
   });
 
+  const versionManager = new VersionManager();
+
   const runtime: AppRuntime = {
     inputManager,
     ruleEngine,
@@ -65,12 +69,17 @@ export function createAppRuntime(config: AppConfig): AppRuntime {
     ruleManager,
     silenceManager,
     templateEngine,
+    versionManager,
     config,
     processedCount: 0,
     alertCount: 0,
     silencedCount: 0,
     startTime: Date.now()
   };
+
+  ruleManager.onRulesChanged(async (event: RulesChangedEvent) => {
+    await versionManager.createSnapshot(event);
+  });
 
   ruleEngine.onAlert(async (alert) => {
     runtime.alertCount++;
@@ -90,6 +99,51 @@ export function createAppRuntime(config: AppConfig): AppRuntime {
   });
 
   return runtime;
+}
+
+export async function rollbackToVersion(
+  runtime: AppRuntime,
+  targetVersion: number,
+  operator: string = 'system'
+): Promise<RollbackResult & { success: boolean }> {
+  const snapshot = runtime.versionManager.getVersion(targetVersion);
+  if (!snapshot) {
+    return {
+      success: false,
+      restoredRuleCount: 0,
+      addedCount: 0,
+      removedCount: 0,
+      modifiedCount: 0,
+      newVersion: 0
+    };
+  }
+
+  const currentRules = runtime.ruleManager.getRules();
+  const targetRules = deepClone(snapshot.rulesAfter);
+
+  const diff = diffRules(currentRules, targetRules);
+
+  runtime.ruleEngine.resetAllState();
+
+  const { addedCount, removedCount, modifiedCount } = runtime.ruleManager.replaceRules(targetRules);
+
+  const newSnapshot = await runtime.versionManager.createSnapshot({
+    changeType: 'rollback',
+    changedRuleIds: [...diff.added.map(r => r.id), ...diff.removed.map(r => r.id), ...diff.modified.map(m => m.ruleId)],
+    rulesBefore: currentRules,
+    rulesAfter: targetRules,
+    operator,
+    rollbackFromVersion: targetVersion
+  });
+
+  return {
+    success: true,
+    restoredRuleCount: targetRules.length,
+    addedCount,
+    removedCount,
+    modifiedCount,
+    newVersion: newSnapshot.version
+  };
 }
 
 export async function startApp(runtime: AppRuntime): Promise<void> {

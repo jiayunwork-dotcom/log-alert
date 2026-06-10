@@ -1,11 +1,18 @@
 import Fastify, { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import fastifyCors from '@fastify/cors';
-import { AppRuntime } from './runtime';
+import { AppRuntime, rollbackToVersion } from './runtime';
 import { AlertRule, RuleStats, TriggeredAlert, Severity, CreateSilenceRequest, ExtendSilenceRequest, TemplatePreviewRequest } from '../types';
 import { inferFormat, InferredFormat } from '../inferrer';
 import { LogParser } from '../parser';
 import * as fs from 'fs';
 import * as path from 'path';
+
+function extractOperator(req: FastifyRequest): string {
+  const header = req.headers['x-operator'];
+  if (typeof header === 'string') return header;
+  if (Array.isArray(header) && header.length > 0) return header[0];
+  return 'system';
+}
 
 export interface ApiServerOptions {
   port?: number;
@@ -69,7 +76,8 @@ export class ApiServer {
     this.fastify.post<{ Params: { id: string }; Body: { enabled: boolean } }>(
       '/api/v1/rules/:id/enabled',
       async (req, reply) => {
-        const ok = this.runtime.ruleManager.setRuleEnabled(req.params.id, req.body.enabled);
+        const operator = extractOperator(req);
+        const ok = this.runtime.ruleManager.setRuleEnabled(req.params.id, req.body.enabled, operator);
         if (!ok) {
           reply.code(404).send({ error: 'Rule not found' });
           return;
@@ -81,7 +89,8 @@ export class ApiServer {
     this.fastify.post<{ Params: { id: string }; Body: { duration_seconds: number } }>(
       '/api/v1/rules/:id/suppress',
       async (req, reply) => {
-        const ok = this.runtime.ruleManager.suppressRule(req.params.id, req.body.duration_seconds || 300);
+        const operator = extractOperator(req);
+        const ok = this.runtime.ruleManager.suppressRule(req.params.id, req.body.duration_seconds || 300, operator);
         if (!ok) {
           reply.code(404).send({ error: 'Rule not found' });
           return;
@@ -93,8 +102,80 @@ export class ApiServer {
     this.fastify.post<{ Params: { id: string } }>(
       '/api/v1/rules/:id/reset',
       async (req, reply) => {
-        this.runtime.ruleManager.resetRuleState(req.params.id);
+        const operator = extractOperator(req);
+        this.runtime.ruleManager.resetRuleState(req.params.id, operator);
         reply.send({ ok: true });
+      }
+    );
+
+    this.fastify.get<{ Querystring: { page?: string; page_size?: string } }>(
+      '/api/v1/rules/versions',
+      async (req, reply) => {
+        const page = parseInt(req.query.page || '1', 10);
+        const pageSize = parseInt(req.query.page_size || '20', 10);
+        const result = this.runtime.versionManager.listVersions(page, pageSize);
+        reply.send(result);
+      }
+    );
+
+    this.fastify.get<{ Params: { version: string } }>(
+      '/api/v1/rules/versions/:version',
+      async (req, reply) => {
+        const version = parseInt(req.params.version, 10);
+        const snapshot = this.runtime.versionManager.getVersion(version);
+        if (!snapshot) {
+          reply.code(404).send({ error: `Version ${version} not found` });
+          return;
+        }
+        reply.send({ snapshot });
+      }
+    );
+
+    this.fastify.get<{ Params: { v1: string; v2: string } }>(
+      '/api/v1/rules/versions/:v1/diff/:v2',
+      async (req, reply) => {
+        const v1 = parseInt(req.params.v1, 10);
+        const v2 = parseInt(req.params.v2, 10);
+        const diff = this.runtime.versionManager.diffVersions(v1, v2);
+        if (diff === null) {
+          reply.code(404).send({ error: `One or both versions not found: v1=${v1}, v2=${v2}` });
+          return;
+        }
+        reply.send({
+          v1,
+          v2,
+          diff
+        });
+      }
+    );
+
+    this.fastify.post<{ Params: { version: string } }>(
+      '/api/v1/rules/versions/:version/rollback',
+      async (req, reply) => {
+        const targetVersion = parseInt(req.params.version, 10);
+        const operator = extractOperator(req);
+
+        const snapshot = this.runtime.versionManager.getVersion(targetVersion);
+        if (!snapshot) {
+          reply.code(404).send({ error: `Version ${targetVersion} not found` });
+          return;
+        }
+
+        const result = await rollbackToVersion(this.runtime, targetVersion, operator);
+
+        if (!result.success) {
+          reply.code(404).send({ error: `Version ${targetVersion} not found` });
+          return;
+        }
+
+        reply.send({
+          ok: true,
+          restored_rule_count: result.restoredRuleCount,
+          added_count: result.addedCount,
+          removed_count: result.removedCount,
+          modified_count: result.modifiedCount,
+          new_version: result.newVersion
+        });
       }
     );
 

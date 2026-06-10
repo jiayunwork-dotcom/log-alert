@@ -399,6 +399,20 @@ export class AlertRuleEngine {
     state.dedupWindow.clear();
     state.aggregateEngine?.reset();
     state.sequenceEngine?.reset();
+    state.stats.triggerCount = 0;
+    state.stats.silencedCount = 0;
+    state.stats.lastTriggeredAt = null;
+    state.stats.firstTriggeredAt = null;
+    state.stats.averageIntervalMs = null;
+    state.stats.intervals = [];
+  }
+
+  resetAllState(): void {
+    for (const ruleId of Array.from(this.ruleStates.keys())) {
+      this.resetRuleState(ruleId);
+    }
+    this.triggeredAlerts.clear();
+    this.silencedAlerts = [];
   }
 
   suppressRule(ruleId: string, durationSeconds: number): boolean {
