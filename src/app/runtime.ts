@@ -3,6 +3,8 @@ import { InputManager } from '../inputs';
 import { AlertRuleEngine } from '../engine';
 import { OutputDispatcher } from '../outputs';
 import { RuleManager } from '../rules';
+import { SilenceManager } from '../silences';
+import { TemplateEngine } from '../templates';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
@@ -12,9 +14,12 @@ export interface AppRuntime {
   ruleEngine: AlertRuleEngine;
   outputDispatcher: OutputDispatcher;
   ruleManager: RuleManager;
+  silenceManager: SilenceManager;
+  templateEngine: TemplateEngine;
   config: AppConfig;
   processedCount: number;
   alertCount: number;
+  silencedCount: number;
   startTime: number;
 }
 
@@ -23,14 +28,31 @@ export function createAppRuntime(config: AppConfig): AppRuntime {
     dryRun: config.dryRun
   });
 
+  const silenceManager = new SilenceManager();
+
+  ruleEngine.setSilenceCheck((alert, rule, now) => {
+    const matched = silenceManager.checkSilenced(alert, rule, now);
+    return matched !== null;
+  });
+
+  const templateEngine = new TemplateEngine({
+    templatesDir: config.templatesDir
+  });
+
   const outputDispatcher = new OutputDispatcher({
     dryRun: config.dryRun,
-    globalOutputs: config.globalOutputs
+    globalOutputs: config.globalOutputs,
+    templateEngine,
+    timezone: config.timezone
   });
+
+  outputDispatcher.setTemplateEngine(templateEngine);
 
   const ruleManager = new RuleManager(ruleEngine, outputDispatcher, {
     dryRun: config.dryRun
   });
+
+  (outputDispatcher as any).options.getRule = (ruleId: string) => ruleManager.getRule(ruleId);
 
   const inputManager = new InputManager({
     timezone: config.timezone
@@ -41,9 +63,12 @@ export function createAppRuntime(config: AppConfig): AppRuntime {
     ruleEngine,
     outputDispatcher,
     ruleManager,
+    silenceManager,
+    templateEngine,
     config,
     processedCount: 0,
     alertCount: 0,
+    silencedCount: 0,
     startTime: Date.now()
   };
 
@@ -61,12 +86,22 @@ export function createAppRuntime(config: AppConfig): AppRuntime {
   inputManager.on('log', (event) => {
     runtime.processedCount++;
     ruleEngine.processLog(event.log);
+    runtime.silencedCount = ruleEngine.getTotalSilencedCount();
   });
 
   return runtime;
 }
 
 export async function startApp(runtime: AppRuntime): Promise<void> {
+  if (runtime.config.templatesDir) {
+    await runtime.templateEngine.loadCustomTemplates(runtime.config.templatesDir);
+  }
+
+  if (runtime.config.silenceFiles && runtime.config.silenceFiles.length > 0) {
+    const silences = await runtime.silenceManager.loadSilenceFiles(runtime.config.silenceFiles);
+    console.info(`[App] Loaded ${silences.length} silences from ${runtime.config.silenceFiles.length} files`);
+  }
+
   if (runtime.config.ruleFiles && runtime.config.ruleFiles.length > 0) {
     const rules = await runtime.ruleManager.loadRuleFiles(runtime.config.ruleFiles);
     console.info(`[App] Loaded ${rules.length} rules from ${runtime.config.ruleFiles.length} files`);
@@ -81,6 +116,8 @@ export async function startApp(runtime: AppRuntime): Promise<void> {
 export async function stopApp(runtime: AppRuntime): Promise<void> {
   await runtime.inputManager.stop();
   runtime.ruleManager.stop();
+  runtime.silenceManager.stop();
+  runtime.templateEngine.stop();
 }
 
 export function loadAppConfig(configPath?: string): AppConfig {
@@ -126,6 +163,19 @@ function parseConfigFile(configPath: string): AppConfig {
     }
   }
 
+  const silenceFiles: string[] = [];
+  if (parsed.silence_files) {
+    if (Array.isArray(parsed.silence_files)) {
+      silenceFiles.push(...parsed.silence_files.map(resolveRelative));
+    } else if (typeof parsed.silence_files === 'string') {
+      silenceFiles.push(resolveRelative(parsed.silence_files));
+    }
+  }
+
+  const templatesDir: string | undefined = parsed.templates_dir
+    ? resolveRelative(parsed.templates_dir)
+    : undefined;
+
   const globalOutputs: OutputChannel[] = [];
   if (parsed.global_outputs && Array.isArray(parsed.global_outputs)) {
     for (const raw of parsed.global_outputs) {
@@ -139,6 +189,8 @@ function parseConfigFile(configPath: string): AppConfig {
   return {
     inputSources,
     ruleFiles,
+    silenceFiles,
+    templatesDir,
     globalOutputs,
     httpApiPort: parsed.http_api_port || 3000,
     dryRun: parsed.dry_run || false,
@@ -200,14 +252,15 @@ function convertParserConfig(raw: any): ParserConfig {
 function convertOutput(raw: any): OutputChannel {
   switch (raw.type) {
     case 'webhook':
-      return { type: 'webhook', url: raw.url, headers: raw.headers };
+      return { type: 'webhook', url: raw.url, headers: raw.headers, templateId: raw.template_id, bodyTemplate: raw.body_template };
     case 'http':
       return {
         type: 'http',
         method: raw.method || 'POST',
         url: raw.url,
         headers: raw.headers,
-        bodyTemplate: raw.body_template
+        bodyTemplate: raw.body_template,
+        templateId: raw.template_id
       };
     case 'console':
     default:

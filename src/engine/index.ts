@@ -9,6 +9,8 @@ export interface RuleEngineOptions {
   defaultSeverity?: Severity;
 }
 
+export type SilenceCheckFn = (alert: TriggeredAlert, rule: AlertRule, now: number) => boolean;
+
 interface RuleRuntimeState {
   aggregateEngine?: AggregateRuleEngine;
   sequenceEngine?: SequenceRuleEngine;
@@ -27,11 +29,17 @@ export class AlertRuleEngine {
   private rules: Map<string, AlertRule> = new Map();
   private ruleStates: Map<string, RuleRuntimeState> = new Map();
   private alertCallbacks: Array<(alert: TriggeredAlert) => void> = [];
+  private silenceCheckFn?: SilenceCheckFn;
   private options: RuleEngineOptions;
   private triggeredAlerts: Map<string, TriggeredAlert> = new Map();
+  private silencedAlerts: Array<{ alert: TriggeredAlert; ruleId: string; at: number }> = [];
 
   constructor(options: RuleEngineOptions = {}) {
     this.options = options;
+  }
+
+  setSilenceCheck(fn: SilenceCheckFn): void {
+    this.silenceCheckFn = fn;
   }
 
   loadRules(rules: AlertRule[]): void {
@@ -48,6 +56,7 @@ export class AlertRuleEngine {
         stats: {
           ruleId: rule.id,
           triggerCount: 0,
+          silencedCount: 0,
           lastTriggeredAt: null,
           firstTriggeredAt: null,
           averageIntervalMs: null,
@@ -116,6 +125,14 @@ export class AlertRuleEngine {
         if (result.triggered) {
           const alert = this.buildAlert(rule, state, result, now);
           if (alert) {
+            if (this.silenceCheckFn && this.silenceCheckFn(alert, rule, now)) {
+              state.stats.silencedCount++;
+              this.silencedAlerts.push({ alert, ruleId: rule.id, at: now });
+              if (this.silencedAlerts.length > 1000) {
+                this.silencedAlerts.shift();
+              }
+              continue;
+            }
             triggered.push(alert);
             this.emitAlert(alert);
           }
@@ -389,5 +406,17 @@ export class AlertRuleEngine {
     if (!state) return false;
     state.suppressedUntil = Date.now() + durationSeconds * 1000;
     return true;
+  }
+
+  getSilencedAlerts(limit: number = 100): Array<{ alert: TriggeredAlert; ruleId: string; at: number }> {
+    return this.silencedAlerts.slice(-limit);
+  }
+
+  getTotalSilencedCount(): number {
+    let total = 0;
+    for (const state of this.ruleStates.values()) {
+      total += state.stats.silencedCount;
+    }
+    return total;
   }
 }

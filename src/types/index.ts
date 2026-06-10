@@ -78,6 +78,8 @@ export interface WebhookOutput {
   type: 'webhook';
   url: string;
   headers?: Record<string, string>;
+  templateId?: string;
+  bodyTemplate?: string;
 }
 
 export interface ConsoleOutput {
@@ -91,6 +93,7 @@ export interface HttpOutput {
   url: string;
   headers?: Record<string, string>;
   bodyTemplate?: string;
+  templateId?: string;
 }
 
 export type OutputChannel = WebhookOutput | ConsoleOutput | HttpOutput;
@@ -141,6 +144,7 @@ export interface TriggeredAlert {
 export interface RuleStats {
   ruleId: string;
   triggerCount: number;
+  silencedCount: number;
   lastTriggeredAt: number | null;
   firstTriggeredAt: number | null;
   averageIntervalMs: number | null;
@@ -198,8 +202,84 @@ export interface ParserConfig {
 export interface AppConfig {
   inputSources: InputSource[];
   ruleFiles: string[];
+  silenceFiles?: string[];
+  templatesDir?: string;
   globalOutputs?: OutputChannel[];
   httpApiPort?: number;
   dryRun?: boolean;
   timezone?: string;
+}
+
+export interface SilenceMatchers {
+  ruleIds?: string[];
+  labels?: Record<string, string>;
+}
+
+export interface Silence {
+  id: string;
+  startsAt: number;
+  endsAt: number;
+  cronExpression?: string;
+  matchers: SilenceMatchers;
+  createdBy: string;
+  comment: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CreateSilenceRequest {
+  startsAt?: number;
+  endsAt?: number;
+  durationSeconds?: number;
+  cronExpression?: string;
+  matchers: SilenceMatchers;
+  createdBy?: string;
+  comment?: string;
+}
+
+export interface ExtendSilenceRequest {
+  durationSeconds: number;
+  duration_seconds?: number;
+}
+
+export interface AlertTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  content: string;
+  isBuiltin: boolean;
+  filePath?: string;
+  loadedAt: number;
+}
+
+export interface TemplatePreviewRequest {
+  templateId: string;
+  alert: Partial<TriggeredAlert> & { rule?: Partial<AlertRule> };
+}
+
+export interface TemplateRenderContext {
+  alert: {
+    id: string;
+    ruleName: string;
+    ruleId: string;
+    severity: Severity;
+    triggeredAt: string;
+    triggeredAtMs: number;
+    logs: StructuredLog[];
+    logsCount: number;
+    groupKey?: string;
+    sequenceKey?: string;
+    isRecovery?: boolean;
+    resolved?: boolean;
+  };
+  rule: {
+    id: string;
+    name: string;
+    description?: string;
+    severity: Severity;
+    priority: number;
+  };
+  logs: StructuredLog[];
+  firstLog?: StructuredLog;
+  lastLog?: StructuredLog;
 }

@@ -1,22 +1,34 @@
-import { OutputChannel, WebhookOutput, ConsoleOutput, HttpOutput, TriggeredAlert, StructuredLog } from '../types';
+import { OutputChannel, WebhookOutput, ConsoleOutput, HttpOutput, TriggeredAlert, StructuredLog, AlertRule } from '../types';
 import chalk from 'chalk';
+import { TemplateEngine } from '../templates';
 
 export interface OutputDispatcherOptions {
   dryRun?: boolean;
   globalOutputs?: OutputChannel[];
+  templateEngine?: TemplateEngine;
+  getRule?: (ruleId: string) => AlertRule | undefined;
+  timezone?: string;
 }
 
 export class OutputDispatcher {
   private channels: Map<string, OutputChannel> = new Map();
   private options: OutputDispatcherOptions;
   private httpClient: typeof fetch;
+  private templateEngine?: TemplateEngine;
+  private timezone: string;
 
   constructor(options: OutputDispatcherOptions = {}) {
     this.options = options;
     this.httpClient = globalThis.fetch || (() => Promise.resolve(new Response()));
+    this.templateEngine = options.templateEngine;
+    this.timezone = options.timezone || 'UTC';
     (options.globalOutputs || []).forEach((ch, i) => {
       this.channels.set(`global_${i}`, ch);
     });
+  }
+
+  setTemplateEngine(engine: TemplateEngine): void {
+    this.templateEngine = engine;
   }
 
   addChannel(id: string, channel: OutputChannel): void {
@@ -87,16 +99,49 @@ export class OutputDispatcher {
     };
   }
 
+  private renderWithTemplate(templateId: string | undefined, alert: TriggeredAlert): string | null {
+    if (!templateId || !this.templateEngine) return null;
+    if (!this.templateEngine.hasTemplate(templateId)) {
+      console.warn(`[OutputDispatcher] Template ${templateId} not found`);
+      return null;
+    }
+    const rule = this.options.getRule ? this.options.getRule(alert.ruleId) : undefined;
+    return this.templateEngine.renderAlert(templateId, alert, rule, this.timezone);
+  }
+
   private async sendWebhook(alert: TriggeredAlert, channel: WebhookOutput): Promise<void> {
-    const payload = this.buildPayload(alert);
+    let body: string;
+    let contentType: string;
+
+    if (channel.bodyTemplate) {
+      const payload = this.buildPayload(alert);
+      body = this.renderLegacyTemplate(channel.bodyTemplate, alert, payload);
+      contentType = 'text/plain';
+    } else if (channel.templateId && this.templateEngine) {
+      const rendered = this.renderWithTemplate(channel.templateId, alert);
+      if (rendered !== null) {
+        body = rendered;
+        contentType = channel.templateId === 'json' ? 'application/json' : 'text/plain';
+      } else {
+        body = JSON.stringify(this.buildPayload(alert));
+        contentType = 'application/json';
+      }
+    } else if (this.templateEngine) {
+      const rule = this.options.getRule ? this.options.getRule(alert.ruleId) : undefined;
+      body = this.templateEngine.renderAlert('json', alert, rule, this.timezone);
+      contentType = 'application/json';
+    } else {
+      body = JSON.stringify(this.buildPayload(alert));
+      contentType = 'application/json';
+    }
 
     const response = await this.httpClient(channel.url, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': contentType,
         ...(channel.headers || {})
       },
-      body: JSON.stringify(payload)
+      body
     });
 
     if (!response.ok) {
@@ -162,17 +207,29 @@ export class OutputDispatcher {
   }
 
   private async sendHttp(alert: TriggeredAlert, channel: HttpOutput): Promise<void> {
-    const payload = this.buildPayload(alert);
-
     let body: string;
+    let contentType: string;
+
     if (channel.bodyTemplate) {
-      body = this.renderTemplate(channel.bodyTemplate, alert, payload);
+      const payload = this.buildPayload(alert);
+      body = this.renderLegacyTemplate(channel.bodyTemplate, alert, payload);
+      contentType = 'text/plain';
+    } else if (channel.templateId && this.templateEngine) {
+      const rendered = this.renderWithTemplate(channel.templateId, alert);
+      if (rendered !== null) {
+        body = rendered;
+        contentType = channel.templateId === 'json' ? 'application/json' : 'text/plain';
+      } else {
+        body = JSON.stringify(this.buildPayload(alert));
+        contentType = 'application/json';
+      }
     } else {
-      body = JSON.stringify(payload);
+      body = JSON.stringify(this.buildPayload(alert));
+      contentType = 'application/json';
     }
 
     const headers: Record<string, string> = {
-      'Content-Type': channel.bodyTemplate ? 'text/plain' : 'application/json',
+      'Content-Type': contentType,
       ...(channel.headers || {})
     };
 
@@ -187,7 +244,7 @@ export class OutputDispatcher {
     }
   }
 
-  private renderTemplate(template: string, alert: TriggeredAlert, payload: Record<string, any>): string {
+  private renderLegacyTemplate(template: string, alert: TriggeredAlert, payload: Record<string, any>): string {
     const ctx = {
       alert,
       payload,

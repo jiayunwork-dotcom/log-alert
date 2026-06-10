@@ -1,7 +1,7 @@
 import Fastify, { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import fastifyCors from '@fastify/cors';
 import { AppRuntime } from './runtime';
-import { AlertRule, RuleStats, TriggeredAlert, Severity } from '../types';
+import { AlertRule, RuleStats, TriggeredAlert, Severity, CreateSilenceRequest, ExtendSilenceRequest, TemplatePreviewRequest } from '../types';
 import { inferFormat, InferredFormat } from '../inferrer';
 import { LogParser } from '../parser';
 import * as fs from 'fs';
@@ -35,8 +35,11 @@ export class ApiServer {
         uptime_seconds: Math.floor(uptime / 1000),
         processed_logs: this.runtime.processedCount,
         alerts_triggered: this.runtime.alertCount,
+        alerts_silenced: this.runtime.silencedCount,
         active_sources: this.runtime.inputManager.getActiveSources(),
-        rule_count: this.runtime.ruleManager.getRules().length
+        rule_count: this.runtime.ruleManager.getRules().length,
+        silence_count: this.runtime.silenceManager.getAllSilences(false).length,
+        template_count: this.runtime.templateEngine.getAllTemplates().length
       });
     });
 
@@ -95,12 +98,207 @@ export class ApiServer {
       }
     );
 
+    this.fastify.get('/api/v1/silences', async (_req, reply) => {
+      const silences = this.runtime.silenceManager.getAllSilences(true).map(s => ({
+        id: s.id,
+        starts_at: s.startsAt,
+        ends_at: s.endsAt,
+        cron_expression: s.cronExpression,
+        matchers: s.matchers,
+        created_by: s.createdBy,
+        comment: s.comment,
+        created_at: s.createdAt,
+        updated_at: s.updatedAt,
+        is_active: this.runtime.silenceManager.isActive(s)
+      }));
+      reply.send({ silences });
+    });
+
+    this.fastify.get<{ Params: { id: string } }>('/api/v1/silences/:id', async (req, reply) => {
+      const silence = this.runtime.silenceManager.getSilence(req.params.id);
+      if (!silence) {
+        reply.code(404).send({ error: 'Silence not found' });
+        return;
+      }
+      reply.send({
+        silence: {
+          ...silence,
+          is_active: this.runtime.silenceManager.isActive(silence)
+        }
+      });
+    });
+
+    this.fastify.post<{ Body: CreateSilenceRequest }>(
+      '/api/v1/silences',
+      async (req, reply) => {
+        try {
+          const request = req.body;
+          if (!request.matchers) {
+            reply.code(400).send({ error: 'matchers is required' });
+            return;
+          }
+          const silence = this.runtime.silenceManager.createSilence(request);
+          reply.code(201).send({ silence });
+        } catch (e: any) {
+          reply.code(400).send({ error: e.message || 'Invalid silence request' });
+        }
+      }
+    );
+
+    this.fastify.delete<{ Params: { id: string } }>(
+      '/api/v1/silences/:id',
+      async (req, reply) => {
+        const ok = this.runtime.silenceManager.deleteSilence(req.params.id);
+        if (!ok) {
+          reply.code(404).send({ error: 'Silence not found' });
+          return;
+        }
+        reply.send({ ok: true });
+      }
+    );
+
+    this.fastify.put<{ Params: { id: string }; Body: ExtendSilenceRequest }>(
+      '/api/v1/silences/:id/extend',
+      async (req, reply) => {
+        const duration = req.body.durationSeconds || req.body.duration_seconds;
+        if (!duration || duration <= 0) {
+          reply.code(400).send({ error: 'Valid durationSeconds is required' });
+          return;
+        }
+        const silence = this.runtime.silenceManager.extendSilence(req.params.id, duration);
+        if (!silence) {
+          reply.code(404).send({ error: 'Silence not found' });
+          return;
+        }
+        reply.send({ silence, extended_by_seconds: duration });
+      }
+    );
+
+    this.fastify.get('/api/v1/templates', async (_req, reply) => {
+      const templates = this.runtime.templateEngine.getAllTemplates().map(t => ({
+        id: t.id,
+        name: t.name,
+        description: t.description,
+        is_builtin: t.isBuiltin,
+        file_path: t.filePath,
+        loaded_at: t.loadedAt
+      }));
+      reply.send({ templates });
+    });
+
+    this.fastify.get<{ Params: { id: string } }>('/api/v1/templates/:id', async (req, reply) => {
+      const template = this.runtime.templateEngine.getTemplate(req.params.id);
+      if (!template) {
+        reply.code(404).send({ error: 'Template not found' });
+        return;
+      }
+      reply.send({
+        template: {
+          id: template.id,
+          name: template.name,
+          description: template.description,
+          content: template.content,
+          is_builtin: template.isBuiltin,
+          file_path: template.filePath,
+          loaded_at: template.loadedAt
+        }
+      });
+    });
+
+    this.fastify.post<{ Body: TemplatePreviewRequest }>(
+      '/api/v1/templates/preview',
+      async (req, reply) => {
+        const { templateId, alert } = req.body;
+        if (!templateId) {
+          reply.code(400).send({ error: 'templateId is required' });
+          return;
+        }
+        if (!this.runtime.templateEngine.hasTemplate(templateId)) {
+          reply.code(404).send({ error: `Template ${templateId} not found` });
+          return;
+        }
+        try {
+          const rendered = this.runtime.templateEngine.preview(
+            templateId,
+            alert || {},
+            this.runtime.config.timezone
+          );
+          reply.send({
+            template_id: templateId,
+            rendered,
+            content_type: templateId === 'json' ? 'application/json' : 'text/plain'
+          });
+        } catch (e: any) {
+          reply.code(500).send({ error: `Template render failed: ${e.message}` });
+        }
+      }
+    );
+
+    this.fastify.post<{ Body: { template_id: string; template_content: string; alert?: any } }>(
+      '/api/v1/templates/render',
+      async (req, reply) => {
+        const { template_id, template_content, alert } = req.body;
+        if (!template_content) {
+          reply.code(400).send({ error: 'template_content is required' });
+          return;
+        }
+        try {
+          const tempId = '__adhoc__';
+          const tplEngine = this.runtime.templateEngine as any;
+          const compiled = tplEngine.handlebars.compile(template_content, { noEscape: true });
+          const mockData = alert || {};
+          const defaultLog = {
+            timestamp: Date.now(),
+            level: 'ERROR',
+            source: 'test',
+            message: 'Sample error message',
+            fields: { component: 'api' },
+            raw: ''
+          };
+          const ctx = {
+            alert: {
+              id: mockData.id || 'preview-alert-001',
+              ruleName: mockData.ruleName || 'Preview Rule',
+              ruleId: mockData.ruleId || 'preview-rule',
+              severity: mockData.severity || 'warning',
+              triggeredAt: new Date(mockData.triggeredAt || Date.now()).toISOString(),
+              triggeredAtMs: mockData.triggeredAt || Date.now(),
+              logs: mockData.logs || [defaultLog],
+              logsCount: (mockData.logs || [defaultLog]).length,
+              groupKey: mockData.groupKey,
+              sequenceKey: mockData.sequenceKey,
+              isRecovery: mockData.isRecovery,
+              resolved: mockData.resolved
+            },
+            rule: {
+              id: mockData.rule?.id || mockData.ruleId || 'preview-rule',
+              name: mockData.rule?.name || mockData.ruleName || 'Preview Rule',
+              description: mockData.rule?.description || 'Rule for preview',
+              severity: mockData.rule?.severity || mockData.severity || 'warning',
+              priority: mockData.rule?.priority || 50
+            },
+            logs: mockData.logs || [defaultLog],
+            firstLog: (mockData.logs || [defaultLog])[0],
+            lastLog: (mockData.logs || [defaultLog])[(mockData.logs || [defaultLog]).length - 1]
+          };
+          const rendered = compiled(ctx);
+          reply.send({
+            template_id,
+            rendered
+          });
+        } catch (e: any) {
+          reply.code(500).send({ error: `Template render failed: ${e.message}` });
+        }
+      }
+    );
+
     this.fastify.get('/api/v1/stats', async (_req, reply) => {
       const stats = this.runtime.ruleEngine.getAllStats();
       reply.send({
         stats,
         total_processed: this.runtime.processedCount,
-        total_alerts: this.runtime.alertCount
+        total_alerts: this.runtime.alertCount,
+        total_silenced: this.runtime.ruleEngine.getTotalSilencedCount()
       });
     });
 
@@ -111,6 +309,11 @@ export class ApiServer {
         return;
       }
       reply.send({ stats });
+    });
+
+    this.fastify.get('/api/v1/alerts/silenced', async (_req, reply) => {
+      const silenced = this.runtime.ruleEngine.getSilencedAlerts(100);
+      reply.send({ silenced_alerts: silenced });
     });
 
     this.fastify.get<{ Querystring: { limit?: string } }>('/api/v1/alerts', async (req, reply) => {
@@ -134,6 +337,7 @@ export class ApiServer {
           this.runtime.processedCount++;
           this.runtime.ruleEngine.processLog(log);
         }
+        this.runtime.silencedCount = this.runtime.ruleEngine.getTotalSilencedCount();
 
         reply.send({
           received: Array.isArray(req.body) ? req.body.length : 1,
@@ -209,11 +413,11 @@ export class ApiServer {
       const parser = new LogParser(parser_config, this.runtime.config.timezone);
       const testEngine = new (require('../engine').AlertRuleEngine)({ dryRun: true });
       const triggeredAlerts: TriggeredAlert[] = [];
-      const ruleHits: Record<string, { rule: AlertRule; hit_count: number; matched_lines: string[]; timestamps: number[] }> = {};
+      const ruleHits: Record<string, { rule: AlertRule; hit_count: number; silenced_count: number; matched_lines: string[]; timestamps: number[] }> = {};
 
       for (const rule of rules) {
         testEngine.addRule(rule);
-        ruleHits[rule.id] = { rule, hit_count: 0, matched_lines: [], timestamps: [] };
+        ruleHits[rule.id] = { rule, hit_count: 0, silenced_count: 0, matched_lines: [], timestamps: [] };
       }
 
       testEngine.onAlert((alert: TriggeredAlert) => {
@@ -240,11 +444,14 @@ export class ApiServer {
         total_lines: lines.length,
         parsed_count: parsedLogs.length,
         alert_count: triggeredAlerts.length,
+        silenced_count: testEngine.getTotalSilencedCount(),
         alerts: triggeredAlerts.slice(0, 100),
+        silenced_alerts: testEngine.getSilencedAlerts(50),
         rule_hits: Object.values(ruleHits).map(rh => ({
           rule_id: rh.rule.id,
           rule_name: rh.rule.name,
           hit_count: rh.hit_count,
+          silenced_count: testEngine.getRuleStats(rh.rule.id)?.silencedCount || 0,
           sample_matches: rh.matched_lines.slice(0, 10),
           trigger_timeline: rh.timestamps.slice(0, 100)
         }))

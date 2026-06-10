@@ -62,9 +62,9 @@ interface RawSequenceCondition {
 }
 
 type RawOutputChannel =
-  | { type: 'webhook'; url: string; headers?: Record<string, string> }
+  | { type: 'webhook'; url: string; headers?: Record<string, string>; template_id?: string; body_template?: string }
   | { type: 'console'; color?: boolean }
-  | { type: 'http'; method: 'GET' | 'POST' | 'PUT'; url: string; headers?: Record<string, string>; body_template?: string };
+  | { type: 'http'; method: 'GET' | 'POST' | 'PUT'; url: string; headers?: Record<string, string>; body_template?: string; template_id?: string };
 
 export class RuleManager {
   private ruleFiles: string[] = [];
@@ -208,7 +208,7 @@ export class RuleManager {
   private convertOutputChannel(raw: RawOutputChannel): OutputChannel {
     switch (raw.type) {
       case 'webhook':
-        return { type: 'webhook', url: raw.url, headers: raw.headers };
+        return { type: 'webhook', url: raw.url, headers: raw.headers, templateId: raw.template_id, bodyTemplate: raw.body_template };
       case 'console':
         return { type: 'console', color: raw.color };
       case 'http':
@@ -217,7 +217,8 @@ export class RuleManager {
           method: raw.method,
           url: raw.url,
           headers: raw.headers,
-          bodyTemplate: raw.body_template
+          bodyTemplate: raw.body_template,
+          templateId: raw.template_id
         };
     }
   }
