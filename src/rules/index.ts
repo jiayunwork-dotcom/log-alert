@@ -6,7 +6,7 @@ import * as yaml from 'js-yaml';
 import { EventEmitter } from 'events';
 import { AlertRuleEngine } from '../engine';
 import { OutputDispatcher } from '../outputs';
-import { ChangeType, RulesChangedEvent, deepClone } from '../versions';
+import { ChangeType, RulesChangedEvent, deepClone, validateCondition, BatchOperation, BatchOperationResult, BatchValidationError, BatchExecuteResult } from '../versions';
 
 function deepCloneRules(rules: AlertRule[]): AlertRule[] {
   return deepClone(rules);
@@ -454,6 +454,303 @@ export class RuleManager extends EventEmitter {
     }
 
     return Array.from(changedIds);
+  }
+
+  private validateCreateRule(rule: any): string[] {
+    const errors: string[] = [];
+
+    if (!rule || typeof rule !== 'object') {
+      return ['rule must be an object'];
+    }
+
+    if (!rule.id || typeof rule.id !== 'string' || rule.id.trim() === '') {
+      errors.push('rule.id is required and must be a non-empty string');
+    }
+
+    if (!rule.name || typeof rule.name !== 'string' || rule.name.trim() === '') {
+      errors.push('rule.name is required and must be a non-empty string');
+    }
+
+    if (!rule.severity || !['critical', 'warning', 'info'].includes(rule.severity)) {
+      errors.push('rule.severity is required and must be one of: critical, warning, info');
+    }
+
+    if (rule.condition === undefined || rule.condition === null) {
+      errors.push('rule.condition is required');
+    } else {
+      const condErrors = validateCondition(rule.condition);
+      for (const err of condErrors) {
+        errors.push(`rule.${err}`);
+      }
+    }
+
+    return errors;
+  }
+
+  private validateUpdateRule(ruleId: string | undefined, changes: any): string[] {
+    const errors: string[] = [];
+
+    if (!ruleId || typeof ruleId !== 'string' || ruleId.trim() === '') {
+      errors.push('ruleId is required and must be a non-empty string');
+      return errors;
+    }
+
+    if (!this.getRule(ruleId)) {
+      errors.push(`rule with id "${ruleId}" not found`);
+      return errors;
+    }
+
+    if (!changes || typeof changes !== 'object') {
+      errors.push('changes must be an object');
+      return errors;
+    }
+
+    if (changes.severity !== undefined && !['critical', 'warning', 'info'].includes(changes.severity)) {
+      errors.push('changes.severity must be one of: critical, warning, info');
+    }
+
+    if (changes.condition !== undefined) {
+      const condErrors = validateCondition(changes.condition);
+      for (const err of condErrors) {
+        errors.push(`changes.${err}`);
+      }
+    }
+
+    return errors;
+  }
+
+  private validateDeleteRule(ruleId: string | undefined): string[] {
+    const errors: string[] = [];
+
+    if (!ruleId || typeof ruleId !== 'string' || ruleId.trim() === '') {
+      errors.push('ruleId is required and must be a non-empty string');
+      return errors;
+    }
+
+    if (!this.getRule(ruleId)) {
+      errors.push(`rule with id "${ruleId}" not found`);
+    }
+
+    return errors;
+  }
+
+  private validateEnableDisable(ruleId: string | undefined): string[] {
+    const errors: string[] = [];
+
+    if (!ruleId || typeof ruleId !== 'string' || ruleId.trim() === '') {
+      errors.push('ruleId is required and must be a non-empty string');
+      return errors;
+    }
+
+    if (!this.getRule(ruleId)) {
+      errors.push(`rule with id "${ruleId}" not found`);
+    }
+
+    return errors;
+  }
+
+  validateBatchOperations(operations: BatchOperation[]): BatchValidationError[] {
+    const validationErrors: BatchValidationError[] = [];
+
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i];
+      let errors: string[] = [];
+
+      switch (op.action) {
+        case 'create':
+          errors = this.validateCreateRule(op.rule);
+          if (op.rule?.id && this.getRule(op.rule.id)) {
+            errors.push(`rule with id "${op.rule.id}" already exists`);
+          }
+          break;
+        case 'update':
+          errors = this.validateUpdateRule(op.ruleId, op.changes);
+          break;
+        case 'delete':
+          errors = this.validateDeleteRule(op.ruleId);
+          break;
+        case 'enable':
+        case 'disable':
+          errors = this.validateEnableDisable(op.ruleId);
+          break;
+        default:
+          errors = [`unknown action: ${(op as any).action}`];
+      }
+
+      if (errors.length > 0) {
+        validationErrors.push({
+          index: i,
+          action: op.action,
+          errors
+        });
+      }
+    }
+
+    return validationErrors;
+  }
+
+  private applyChangesToRule(rule: AlertRule, changes: any): AlertRule {
+    const result = deepClone(rule);
+    for (const key of Object.keys(changes)) {
+      if (key === 'id') continue;
+      (result as any)[key] = deepClone(changes[key]);
+    }
+    return result;
+  }
+
+  async executeBatch(operations: BatchOperation[], operator: string = 'system'): Promise<BatchExecuteResult> {
+    const validationErrors = this.validateBatchOperations(operations);
+
+    if (validationErrors.length > 0) {
+      return {
+        success: false,
+        results: operations.map((op, i) => {
+          const err = validationErrors.find(e => e.index === i);
+          return {
+            action: op.action,
+            ruleId: op.ruleId || (op.rule?.id),
+            success: !err,
+            error: err ? err.errors.join('; ') : undefined
+          };
+        }),
+        rulesBefore: this.getRules(),
+        rulesAfter: this.getRules(),
+        changedRuleIds: [],
+        validationErrors
+      };
+    }
+
+    const rulesBefore = deepCloneRules(this.rules);
+    const results: BatchOperationResult[] = [];
+    const changedRuleIds: string[] = [];
+    let failed = false;
+    let failedIndex = -1;
+
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i];
+      try {
+        switch (op.action) {
+          case 'create': {
+            const newRule = deepClone(op.rule) as AlertRule;
+            if (newRule.enabled === undefined) newRule.enabled = true;
+            if (newRule.priority === undefined) newRule.priority = 100;
+            if (!newRule.actions) newRule.actions = [];
+            this.engine.addRule(newRule);
+            this.rules.push(newRule);
+            changedRuleIds.push(newRule.id);
+            results.push({
+              action: 'create',
+              ruleId: newRule.id,
+              success: true,
+              rule: deepClone(newRule)
+            });
+            break;
+          }
+          case 'update': {
+            const existingRule = this.getRule(op.ruleId!);
+            if (!existingRule) {
+              throw new Error(`rule "${op.ruleId}" not found during execution`);
+            }
+            const updatedRule = this.applyChangesToRule(existingRule, op.changes);
+            this.engine.updateRule(updatedRule);
+            const idx = this.rules.findIndex(r => r.id === op.ruleId);
+            this.rules[idx] = updatedRule;
+            changedRuleIds.push(op.ruleId!);
+            results.push({
+              action: 'update',
+              ruleId: op.ruleId,
+              success: true,
+              rule: deepClone(updatedRule)
+            });
+            break;
+          }
+          case 'delete': {
+            this.engine.removeRule(op.ruleId!);
+            this.rules = this.rules.filter(r => r.id !== op.ruleId);
+            changedRuleIds.push(op.ruleId!);
+            results.push({
+              action: 'delete',
+              ruleId: op.ruleId,
+              success: true
+            });
+            break;
+          }
+          case 'enable': {
+            this.engine.setRuleEnabled(op.ruleId!, true);
+            const idx = this.rules.findIndex(r => r.id === op.ruleId);
+            if (idx !== -1) {
+              this.rules[idx] = { ...this.rules[idx], enabled: true };
+            }
+            changedRuleIds.push(op.ruleId!);
+            results.push({
+              action: 'enable',
+              ruleId: op.ruleId,
+              success: true
+            });
+            break;
+          }
+          case 'disable': {
+            this.engine.setRuleEnabled(op.ruleId!, false);
+            const idx = this.rules.findIndex(r => r.id === op.ruleId);
+            if (idx !== -1) {
+              this.rules[idx] = { ...this.rules[idx], enabled: false };
+            }
+            changedRuleIds.push(op.ruleId!);
+            results.push({
+              action: 'disable',
+              ruleId: op.ruleId,
+              success: true
+            });
+            break;
+          }
+          default:
+            throw new Error(`unknown action: ${(op as any).action}`);
+        }
+      } catch (e: any) {
+        failed = true;
+        failedIndex = i;
+        results.push({
+          action: op.action,
+          ruleId: op.ruleId || (op.rule?.id),
+          success: false,
+          error: e.message || 'unknown error'
+        });
+        break;
+      }
+    }
+
+    if (failed) {
+      this.rules = rulesBefore;
+      this.engine.resetAllState();
+      for (const rule of rulesBefore) {
+        this.engine.addRule(rule);
+      }
+      return {
+        success: false,
+        results,
+        rulesBefore: deepCloneRules(rulesBefore),
+        rulesAfter: deepCloneRules(rulesBefore),
+        changedRuleIds: []
+      };
+    }
+
+    const rulesAfter = deepCloneRules(this.rules);
+
+    this.emitRulesChanged({
+      changeType: 'batch',
+      changedRuleIds: [...new Set(changedRuleIds)],
+      rulesBefore,
+      rulesAfter,
+      operator
+    });
+
+    return {
+      success: true,
+      results,
+      rulesBefore: deepCloneRules(rulesBefore),
+      rulesAfter: deepCloneRules(rulesAfter),
+      changedRuleIds: [...new Set(changedRuleIds)]
+    };
   }
 
   stop(): void {

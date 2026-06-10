@@ -5,7 +5,7 @@ import { OutputDispatcher } from '../outputs';
 import { RuleManager } from '../rules';
 import { SilenceManager } from '../silences';
 import { TemplateEngine } from '../templates';
-import { VersionManager, RulesChangedEvent, deepClone, RollbackResult, diffRules } from '../versions';
+import { VersionManager, RulesChangedEvent, deepClone, RollbackResult, diffRules, applyJsonPatch, JsonPatchOperation, diffToJsonPatch } from '../versions';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
@@ -144,6 +144,71 @@ export async function rollbackToVersion(
     modifiedCount,
     newVersion: newSnapshot.version
   };
+}
+
+export async function rollbackByTag(
+  runtime: AppRuntime,
+  tagName: string,
+  operator: string = 'system'
+): Promise<RollbackResult & { success: boolean; error?: string }> {
+  const tag = runtime.versionManager.getTag(tagName);
+  if (!tag) {
+    return {
+      success: false,
+      restoredRuleCount: 0,
+      addedCount: 0,
+      removedCount: 0,
+      modifiedCount: 0,
+      newVersion: 0,
+      error: `Tag "${tagName}" not found`
+    };
+  }
+  return rollbackToVersion(runtime, tag.version, operator);
+}
+
+export async function applyPatch(
+  runtime: AppRuntime,
+  patch: JsonPatchOperation[],
+  operator: string = 'system'
+): Promise<{ success: boolean; newVersion: number; error?: string; changedRuleIds: string[]; rulesAfter: AlertRule[] }> {
+  const currentRules = runtime.ruleManager.getRules();
+
+  try {
+    const newRules = applyJsonPatch(currentRules, patch);
+
+    const diff = diffRules(currentRules, newRules);
+    const changedRuleIds = [
+      ...diff.added.map(r => r.id),
+      ...diff.removed.map(r => r.id),
+      ...diff.modified.map(m => m.ruleId)
+    ];
+
+    runtime.ruleEngine.resetAllState();
+    runtime.ruleManager.replaceRules(newRules);
+
+    const newSnapshot = await runtime.versionManager.createSnapshot({
+      changeType: 'patch',
+      changedRuleIds,
+      rulesBefore: currentRules,
+      rulesAfter: newRules,
+      operator
+    });
+
+    return {
+      success: true,
+      newVersion: newSnapshot.version,
+      changedRuleIds,
+      rulesAfter: newRules
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      newVersion: 0,
+      error: e.message || 'Failed to apply patch',
+      changedRuleIds: [],
+      rulesAfter: currentRules
+    };
+  }
 }
 
 export async function startApp(runtime: AppRuntime): Promise<void> {

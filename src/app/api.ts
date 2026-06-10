@@ -1,9 +1,10 @@
 import Fastify, { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import fastifyCors from '@fastify/cors';
-import { AppRuntime, rollbackToVersion } from './runtime';
+import { AppRuntime, rollbackToVersion, rollbackByTag, applyPatch } from './runtime';
 import { AlertRule, RuleStats, TriggeredAlert, Severity, CreateSilenceRequest, ExtendSilenceRequest, TemplatePreviewRequest } from '../types';
 import { inferFormat, InferredFormat } from '../inferrer';
 import { LogParser } from '../parser';
+import { BatchOperation, DiffFormat, JsonPatchOperation } from '../versions';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -108,6 +109,48 @@ export class ApiServer {
       }
     );
 
+    this.fastify.post<{ Body: { operations: BatchOperation[] } }>(
+      '/api/v1/rules/batch',
+      async (req, reply) => {
+        const operator = extractOperator(req);
+        const { operations } = req.body;
+
+        if (!Array.isArray(operations) || operations.length === 0) {
+          reply.code(400).send({ error: 'operations must be a non-empty array' });
+          return;
+        }
+
+        const result = await this.runtime.ruleManager.executeBatch(operations, operator);
+
+        if (!result.success && result.validationErrors) {
+          reply.code(400).send({
+            ok: false,
+            error: 'Validation failed for one or more operations',
+            validation_errors: result.validationErrors,
+            results: result.results
+          });
+          return;
+        }
+
+        if (!result.success) {
+          reply.code(500).send({
+            ok: false,
+            error: 'Batch execution failed, all operations rolled back',
+            results: result.results
+          });
+          return;
+        }
+
+        const latestVersion = this.runtime.versionManager.getLatestVersion();
+
+        reply.send({
+          ok: true,
+          results: result.results,
+          version: latestVersion?.version || 0
+        });
+      }
+    );
+
     this.fastify.get<{ Querystring: { page?: string; page_size?: string } }>(
       '/api/v1/rules/versions',
       async (req, reply) => {
@@ -131,20 +174,54 @@ export class ApiServer {
       }
     );
 
-    this.fastify.get<{ Params: { v1: string; v2: string } }>(
+    this.fastify.get<{ Params: { v1: string; v2: string }; Querystring: { format?: string } }>(
       '/api/v1/rules/versions/:v1/diff/:v2',
       async (req, reply) => {
         const v1 = parseInt(req.params.v1, 10);
         const v2 = parseInt(req.params.v2, 10);
-        const diff = this.runtime.versionManager.diffVersions(v1, v2);
-        if (diff === null) {
+        const format = (req.query.format || 'json') as DiffFormat;
+
+        if (!['json', 'text', 'patch'].includes(format)) {
+          reply.code(400).send({ error: 'Invalid format. Must be one of: json, text, patch' });
+          return;
+        }
+
+        const result = this.runtime.versionManager.diffVersionsFormatted(v1, v2, format);
+        if (result === null) {
           reply.code(404).send({ error: `One or both versions not found: v1=${v1}, v2=${v2}` });
           return;
         }
+
+        if (format === 'text') {
+          reply.type('text/plain').send(result);
+        } else {
+          reply.send(result);
+        }
+      }
+    );
+
+    this.fastify.post<{ Body: JsonPatchOperation[] }>(
+      '/api/v1/rules/versions/apply-patch',
+      async (req, reply) => {
+        const operator = extractOperator(req);
+        const patch = req.body;
+
+        if (!Array.isArray(patch)) {
+          reply.code(400).send({ error: 'Request body must be a JSON Patch array' });
+          return;
+        }
+
+        const result = await applyPatch(this.runtime, patch, operator);
+
+        if (!result.success) {
+          reply.code(400).send({ error: result.error || 'Failed to apply patch' });
+          return;
+        }
+
         reply.send({
-          v1,
-          v2,
-          diff
+          ok: true,
+          new_version: result.newVersion,
+          changed_rule_ids: result.changedRuleIds
         });
       }
     );
@@ -170,6 +247,88 @@ export class ApiServer {
 
         reply.send({
           ok: true,
+          restored_rule_count: result.restoredRuleCount,
+          added_count: result.addedCount,
+          removed_count: result.removedCount,
+          modified_count: result.modifiedCount,
+          new_version: result.newVersion
+        });
+      }
+    );
+
+    this.fastify.post<{ Params: { version: string }; Body: { name: string; description?: string } }>(
+      '/api/v1/rules/versions/:version/tag',
+      async (req, reply) => {
+        const version = parseInt(req.params.version, 10);
+        const { name, description } = req.body;
+        const operator = extractOperator(req);
+
+        if (!name || typeof name !== 'string' || name.trim() === '') {
+          reply.code(400).send({ error: 'tag name is required and must be a non-empty string' });
+          return;
+        }
+
+        const snap = this.runtime.versionManager.getVersion(version);
+        if (!snap) {
+          reply.code(404).send({ error: `Version ${version} not found` });
+          return;
+        }
+
+        const existingTag = this.runtime.versionManager.getTag(name);
+        if (existingTag) {
+          reply.code(409).send({ error: `Tag "${name}" already exists` });
+          return;
+        }
+
+        const tag = this.runtime.versionManager.createTag(version, name, description, operator);
+        if (!tag) {
+          reply.code(500).send({ error: 'Failed to create tag' });
+          return;
+        }
+
+        reply.code(201).send({ tag });
+      }
+    );
+
+    this.fastify.get('/api/v1/rules/versions/tags', async (_req, reply) => {
+      const tags = this.runtime.versionManager.listTags();
+      reply.send({ tags });
+    });
+
+    this.fastify.get<{ Params: { tagName: string } }>(
+      '/api/v1/rules/versions/by-tag/:tagName',
+      async (req, reply) => {
+        const snapshot = this.runtime.versionManager.getVersionByTag(req.params.tagName);
+        if (!snapshot) {
+          reply.code(404).send({ error: `Tag "${req.params.tagName}" not found` });
+          return;
+        }
+        reply.send({ snapshot, tag: this.runtime.versionManager.getTag(req.params.tagName) });
+      }
+    );
+
+    this.fastify.post<{ Params: { tagName: string } }>(
+      '/api/v1/rules/versions/by-tag/:tagName/rollback',
+      async (req, reply) => {
+        const operator = extractOperator(req);
+
+        const tag = this.runtime.versionManager.getTag(req.params.tagName);
+        if (!tag) {
+          reply.code(404).send({ error: `Tag "${req.params.tagName}" not found` });
+          return;
+        }
+
+        const result = await rollbackByTag(this.runtime, req.params.tagName, operator);
+
+        if (!result.success) {
+          reply.code(404).send({ error: result.error || 'Rollback failed' });
+          return;
+        }
+
+        reply.send({
+          ok: true,
+          tag: req.params.tagName,
+          target_version: tag.version,
           restored_rule_count: result.restoredRuleCount,
           added_count: result.addedCount,
           removed_count: result.removedCount,
