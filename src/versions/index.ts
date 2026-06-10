@@ -242,27 +242,31 @@ export function diffToJsonPatch(rulesV1: AlertRule[], rulesV2: AlertRule[]): Jso
   for (const r of rulesV1) v1Map.set(r.id, r);
   for (const r of rulesV2) v2Map.set(r.id, r);
 
-  let v1Index = 0;
-  for (const rule of rulesV1) {
+  const v1Remaining = [...rulesV1];
+  const removePatches: JsonPatchOperation[] = [];
+  for (let i = rulesV1.length - 1; i >= 0; i--) {
+    const rule = rulesV1[i];
     if (!v2Map.has(rule.id)) {
-      patches.push({ op: 'remove', path: `/rules/${v1Index}` });
-    } else {
-      v1Index++;
+      removePatches.push({ op: 'remove', path: `/rules/${i}` });
+      v1Remaining.splice(i, 1);
     }
   }
+  patches.push(...removePatches);
 
-  for (const rule of rulesV2) {
+  let insertCount = 0;
+  for (let i = 0; i < rulesV2.length; i++) {
+    const rule = rulesV2[i];
     if (!v1Map.has(rule.id)) {
-      const v1Rules = rulesV1.filter(r => v2Map.has(r.id));
-      const insertIndex = v1Rules.length;
-      patches.push({ op: 'add', path: `/rules/${insertIndex}`, value: deepClone(rule) });
+      patches.push({ op: 'add', path: `/rules/${i}`, value: deepClone(rule) });
+      insertCount++;
     } else {
       const oldRule = v1Map.get(rule.id)!;
       const changes = diffObjects(oldRule, rule);
       if (changes.length > 0) {
-        const idx = rulesV1.findIndex(r => r.id === rule.id);
+        const idxInV1Remaining = v1Remaining.findIndex(r => r.id === rule.id);
+        const currentIdx = idxInV1Remaining + insertCount;
         for (const change of changes) {
-          const path = `/rules/${idx}/${change.path.replace(/\./g, '/')}`;
+          const path = `/rules/${currentIdx}/${change.path.replace(/\./g, '/')}`;
           if (change.oldValue === null && change.newValue !== null) {
             patches.push({ op: 'add', path, value: deepClone(change.newValue) });
           } else if (change.oldValue !== null && change.newValue === null) {

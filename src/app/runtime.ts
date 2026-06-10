@@ -166,6 +166,47 @@ export async function rollbackByTag(
   return rollbackToVersion(runtime, tag.version, operator);
 }
 
+export function extractAffectedRuleIdsFromPatch(rules: AlertRule[], patch: JsonPatchOperation[]): string[] {
+  const affectedIds = new Set<string>();
+  const currentRules = [...rules];
+
+  for (const op of patch) {
+    const pathMatch = op.path.match(/^\/rules\/(\d+)/);
+    if (pathMatch) {
+      const idx = parseInt(pathMatch[1], 10);
+      if (idx >= 0 && idx < currentRules.length && currentRules[idx]?.id) {
+        affectedIds.add(currentRules[idx].id);
+      }
+    }
+
+    if (op.from) {
+      const fromMatch = op.from.match(/^\/rules\/(\d+)/);
+      if (fromMatch) {
+        const idx = parseInt(fromMatch[1], 10);
+        if (idx >= 0 && idx < currentRules.length && currentRules[idx]?.id) {
+          affectedIds.add(currentRules[idx].id);
+        }
+      }
+    }
+
+    if (op.op === 'remove' && pathMatch) {
+      const idx = parseInt(pathMatch[1], 10);
+      if (idx >= 0 && idx < currentRules.length) {
+        if (currentRules[idx]?.id) {
+          affectedIds.add(currentRules[idx].id);
+        }
+        currentRules.splice(idx, 1);
+      }
+    } else if (op.op === 'add' && pathMatch && op.value?.id) {
+      const idx = parseInt(pathMatch[1], 10);
+      affectedIds.add(op.value.id);
+      currentRules.splice(idx, 0, op.value);
+    }
+  }
+
+  return Array.from(affectedIds);
+}
+
 export async function applyPatch(
   runtime: AppRuntime,
   patch: JsonPatchOperation[],
@@ -177,11 +218,15 @@ export async function applyPatch(
     const newRules = applyJsonPatch(currentRules, patch);
 
     const diff = diffRules(currentRules, newRules);
-    const changedRuleIds = [
+    let changedRuleIds = [
       ...diff.added.map(r => r.id),
       ...diff.removed.map(r => r.id),
       ...diff.modified.map(m => m.ruleId)
     ];
+
+    if (changedRuleIds.length === 0 && patch.length > 0) {
+      changedRuleIds = extractAffectedRuleIdsFromPatch(currentRules, patch);
+    }
 
     runtime.ruleEngine.resetAllState();
     runtime.ruleManager.replaceRules(newRules);

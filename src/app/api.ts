@@ -141,12 +141,30 @@ export class ApiServer {
           return;
         }
 
-        const latestVersion = this.runtime.versionManager.getLatestVersion();
+        const expectedIds = JSON.stringify([...result.changedRuleIds].sort());
+        const version = await new Promise<number>((resolve) => {
+          const handler = (snapshot: any) => {
+            if (snapshot.changeType === 'batch') {
+              const snapshotIds = JSON.stringify([...snapshot.changedRuleIds].sort());
+              if (snapshotIds === expectedIds) {
+                this.runtime.versionManager.off('snapshotCreated', handler);
+                clearTimeout(timeout);
+                resolve(snapshot.version);
+              }
+            }
+          };
+          this.runtime.versionManager.on('snapshotCreated', handler);
+          const timeout = setTimeout(() => {
+            this.runtime.versionManager.off('snapshotCreated', handler);
+            const latest = this.runtime.versionManager.getLatestVersion();
+            resolve(latest?.version || 0);
+          }, 1000);
+        });
 
         reply.send({
           ok: true,
           results: result.results,
-          version: latestVersion?.version || 0
+          version
         });
       }
     );
