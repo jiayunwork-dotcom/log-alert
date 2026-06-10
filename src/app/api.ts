@@ -208,9 +208,11 @@ export class ApiServer {
     this.fastify.post<{ Body: TemplatePreviewRequest }>(
       '/api/v1/templates/preview',
       async (req, reply) => {
-        const { templateId, alert } = req.body;
+        const body = req.body as any;
+        const templateId = body.templateId || body.template_id;
+        const alert = body.alert;
         if (!templateId) {
-          reply.code(400).send({ error: 'templateId is required' });
+          reply.code(400).send({ error: 'templateId or template_id is required' });
           return;
         }
         if (!this.runtime.templateEngine.hasTemplate(templateId)) {

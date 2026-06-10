@@ -62,6 +62,38 @@ describe('SilenceManager', () => {
       expect(manager.getSilence(silence.id)).toBeDefined();
     });
 
+    it('should accept snake_case parameters (rule_ids, created_by, duration_seconds)', () => {
+      const now = Date.now();
+      const silence = manager.createSilence({
+        duration_seconds: 7200,
+        matchers: {
+          rule_ids: ['error_log_detected']
+        } as any,
+        created_by: 'ops-team@example.com',
+        comment: 'Snake case params'
+      } as any);
+
+      expect(silence.createdBy).toBe('ops-team@example.com');
+      expect(silence.matchers.ruleIds).toEqual(['error_log_detected']);
+      expect(silence.matchers.ruleIds).not.toBeUndefined();
+      expect(silence.endsAt - silence.startsAt).toBe(7200 * 1000);
+    });
+
+    it('should match only specified rule_ids and not suppress other rules', () => {
+      manager.createSilence({
+        duration_seconds: 3600,
+        matchers: { rule_ids: ['error_log_detected'] } as any
+      } as any);
+
+      const matching = manager.getMatchingSilences('error_log_detected', undefined);
+      const notMatching = manager.getMatchingSilences('http_5xx_error', undefined);
+      const alsoNotMatching = manager.getMatchingSilences('another_rule', undefined);
+
+      expect(matching.length).toBe(1);
+      expect(notMatching.length).toBe(0);
+      expect(alsoNotMatching.length).toBe(0);
+    });
+
     it('should create silence with explicit start and end times', () => {
       const now = Date.now();
       const startsAt = now;
@@ -360,6 +392,7 @@ describe('SilenceManager', () => {
     it('should combine rule IDs and labels (AND logic)', () => {
       const now = Date.now();
       manager.createSilence({
+        startsAt: now,
         durationSeconds: 3600,
         matchers: {
           ruleIds: ['rule-db'],
@@ -414,16 +447,19 @@ describe('SilenceManager', () => {
     it('should get matching silences for a rule', () => {
       const now = Date.now();
       manager.createSilence({
+        startsAt: now,
         durationSeconds: 3600,
         matchers: { ruleIds: ['rule-1'] },
         comment: 'silence-a'
       });
       manager.createSilence({
+        startsAt: now,
         durationSeconds: 3600,
         matchers: { ruleIds: ['rule-1', 'rule-2'] },
         comment: 'silence-b'
       });
       manager.createSilence({
+        startsAt: now,
         durationSeconds: 3600,
         matchers: { ruleIds: ['rule-3'] },
         comment: 'silence-c'

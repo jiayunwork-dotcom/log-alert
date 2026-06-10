@@ -180,9 +180,23 @@ export class SilenceManager {
     let startsAt: number;
     let endsAt: number;
 
-    if (request.durationSeconds !== undefined) {
+    const reqDuration: number | undefined = (request as any).duration_seconds !== undefined
+      ? (request as any).duration_seconds
+      : request.durationSeconds;
+
+    const reqCreatedBy: string | undefined = (request as any).created_by !== undefined
+      ? (request as any).created_by
+      : request.createdBy;
+
+    const rawMatchers = request.matchers || {};
+    const matchers = {
+      ruleIds: (rawMatchers as any).rule_ids || rawMatchers.ruleIds,
+      labels: rawMatchers.labels
+    };
+
+    if (reqDuration !== undefined) {
       startsAt = request.startsAt || now;
-      endsAt = startsAt + request.durationSeconds * 1000;
+      endsAt = startsAt + reqDuration * 1000;
     } else {
       startsAt = request.startsAt || now;
       endsAt = request.endsAt || now + 3600 * 1000;
@@ -193,8 +207,8 @@ export class SilenceManager {
       startsAt,
       endsAt,
       cronExpression: request.cronExpression,
-      matchers: request.matchers,
-      createdBy: request.createdBy || 'api',
+      matchers,
+      createdBy: reqCreatedBy || 'api',
       comment: request.comment || '',
       createdAt: now,
       updatedAt: now
